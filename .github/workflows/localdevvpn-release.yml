@@ -1,0 +1,149 @@
+name: LocalDevVPN compatibility build
+
+on:
+  push:
+    branches: [localdevvpn-remote-pairing]
+    paths: ['.github/workflows/localdevvpn-release.yml']
+
+concurrency:
+  group: localdevvpn-remote-pairing
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      SIDESTORE_REF: 044bd72ad4eb270c3900bd04dc6f508d0ac474db
+      scheme: LiveContainer
+      archive_path: archive
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '27.2'
+      - name: Build SideStore preserving the original pairing record
+        run: |
+          command -v ldid > /dev/null || brew install ldid
+          git init "$RUNNER_TEMP/sidestore"
+          cd "$RUNNER_TEMP/sidestore"
+          git fetch --depth=1 https://github.com/LiveContainer/SideStore.git "$SIDESTORE_REF"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent, indent
+
+          manager = Path('SideStore/Core/Pairing/PairingFileManager.swift')
+          source = manager.read_text()
+          start = source.index('    nonisolated func sanitizePairingFileFor')
+          end = source.index('    @discardableResult', start)
+          loader = '''
+          nonisolated func fetchPairingFile(preferred: PairingProtocol? = nil) -> String? {
+              loadPairingFile(preferred: preferred)?.rawContent
+          }
+
+          nonisolated func loadPairingFile(preferred: PairingProtocol? = nil) -> (any PairingFile)? {
+              guard !UserDefaults.standard.isPairingReset else { return nil }
+
+              let defaultProtocols: [PairingProtocol]
+              if #available(iOS 26.4, *) {
+                  defaultProtocols = [.rppairing, .lockdown]
+              } else {
+                  defaultProtocols = [.lockdown, .rppairing]
+              }
+
+              let configuredProtocols = [preferred ?? preferredProtocol, persistedActiveProtocol].compactMap { $0 }
+              let protocols = configuredProtocols + defaultProtocols
+              for mode in protocols where mode != .unknown {
+                  if let contents = fetchPairingFile(for: mode),
+                     let file = try? parse(content: contents, preferred: mode) {
+                      return file
+                  }
+              }
+
+              if let contents = fetchPairingFile(for: .unknown) {
+                  for mode in protocols where mode != .unknown {
+                      if let file = try? parse(content: contents, preferred: mode) {
+                          return file
+                      }
+                  }
+              }
+              return nil
+          }
+          '''
+          manager.write_text(source[:start] + indent(dedent(loader).lstrip(), '    ') + '\n' + source[end:])
+
+          boot = Path('SideStore/AppBootManager.swift')
+          source = boot.read_text()
+          source = source.replace('import Minimuxer\n', 'import Minimuxer\nimport MinimuxerCommon\n')
+          source = source.replace('startMinimuxer(pairingFile: String)', 'startMinimuxer(pairingFile: String, protocolOverride: PairingProtocol? = nil)')
+          source = source.replace('let preferred = PairingFileManager.shared.preferredProtocol', 'let preferred = protocolOverride ?? PairingFileManager.shared.preferredProtocol')
+          for variable in ('pairingString', 'pf'):
+              source = source.replace(f'guard let {variable} = PairingFileManager.shared.fetchPairingFile()', 'guard let pairing = PairingFileManager.shared.loadPairingFile()')
+              source = source.replace(f'startMinimuxer(pairingFile: {variable})', 'startMinimuxer(pairingFile: pairing.rawContent, protocolOverride: pairing.mode)', 1)
+          source = source.replace('pairingContent: pairingString', 'pairingContent: pairing.rawContent')
+          source = source.replace('startMinimuxer(pairingFile: pairingString)', 'startMinimuxer(pairingFile: pairing.rawContent)')
+          assert source.count('protocolOverride: pairing.mode') == 2
+          boot.write_text(source)
+          PY
+          git diff --check
+          make build
+          make fakesign
+          make ipa
+      - name: Build and package LiveContainer plus SideStore
+        run: |
+          sh .github/prepare_dependencies.sh
+          xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -project LiveContainer.xcodeproj -sdk iphoneos -arch arm64 -configuration Release
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path('.github/build_github.sh').read_text()
+          original = 'wget https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa'
+          assert script.count(original) == 1
+          script = script.replace(original, 'cp "$RUNNER_TEMP/sidestore/SideStore.ipa" SideStore.ipa')
+          script = script.replace('brew install ldid', 'command -v ldid > /dev/null || brew install ldid')
+          script = script.replace('rm -r .zsign_cache\n', '')
+          script = '\n'.join(line for line in script.splitlines() if not line.startswith('find payloadlc/Payload')) + '\n'
+          Path('package-combined.sh').write_text(script)
+          PY
+          sh -e package-combined.sh
+          unzip -tq 'LiveContainer+SideStore.ipa'
+          python3 - <<'PY'
+          import plistlib
+          from zipfile import ZipFile
+
+          with ZipFile('LiveContainer+SideStore.ipa') as ipa:
+              paths = set(ipa.namelist())
+              app = 'Payload/LiveContainer.app/'
+              for path in ('LiveContainer', 'Frameworks/SideStoreApp.framework/SideStore', 'PlugIns/LiveWidgetExtension.appex/LiveWidgetExtension'):
+                  assert app + path in paths, path
+              info = plistlib.loads(ipa.read(app + 'Info.plist'))
+              assert 'group.com.SideStore.SideStore' in info['ALTAppGroups']
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LiveContainer+SideStore
+          path: LiveContainer+SideStore.ipa
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: LiveContainer+SideStore
+      - name: Publish compatibility prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: localdevvpn-pairing-${{ github.run_number }}
+        run: |
+          gh release create "$RELEASE_TAG" 'LiveContainer+SideStore.ipa' --target "$GITHUB_SHA" --prerelease --title 'LiveContainer + SideStore — LocalDevVPN 配對測試版' --notes '內建 SideStore 保留完整配對檔欄位，並以實際選用的協定初始化。此版本仍需在 iOS 27.2.1 實機確認刷新和安裝。'
